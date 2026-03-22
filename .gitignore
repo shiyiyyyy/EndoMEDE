@@ -1,0 +1,12 @@
+# 忽略图片文件
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.pyc
+root/
+results/
+# 忽略模型权重文件
+*.pth
+.idea/
+
