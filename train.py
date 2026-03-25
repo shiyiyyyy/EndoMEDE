@@ -34,7 +34,7 @@ parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--min-depth', default=0.001, type=float)
 parser.add_argument('--max-depth', default=100, type=float)
 parser.add_argument('--epochs', default=60, type=int)
-parser.add_argument('--bs', default=16, type=int)
+parser.add_argument('--bs', default=8, type=int)
 parser.add_argument('--lr', default=0.000005, type=float)
 #parser.add_argument('--pretrained-from',default="./checkpoints/depth_anything_v2_metric_hypersim_vitb.pth",type=str)
 parser.add_argument('--pretrained-from',type=str) #default="checkpoints/depth_anything_v2_metric_hypersim_vitl.pth",.././checkpoints/depth_anything_v2_metric_hypersim_vitb.pth
