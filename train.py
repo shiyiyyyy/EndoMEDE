@@ -13,9 +13,9 @@ from torch.optim import AdamW
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import time
-from dataset.hypersim import Hypersim
-from dataset.kitti import KITTI
-from dataset.vkitti2 import VKITTI2
+# from dataset.hypersim import Hypersim
+# from dataset.kitti import KITTI
+# from dataset.vkitti2 import VKITTI2
 from dataset.c3vd import C3VD
 from dataset.scared import SCARED
 from depth_anything_v2.dpt import DepthAnythingV2
@@ -42,6 +42,20 @@ parser.add_argument('--save-path', default="./results/all/40epo",type=str)
 parser.add_argument('--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 parser.add_argument("--lora_type",default="lora",choices=["lora","None"],type=str,help="whether lora use for the model")
+parser.add_argument('--patience', default=10, type=int, help='early stopping patience (epochs without rmse improvement)')
+
+
+def detect_specular(img, threshold=0.85):
+    """
+    检测内窥镜图像中的高光区域
+    img: 已归一化的 tensor (B, 3, H, W)，mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]
+    返回 specular_mask (B, H, W)，True 表示高光区域（训练时排除）
+    """
+    mean = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(1, 3, 1, 1)
+    img_raw = img * std + mean  # 反归一化到 [0, 1]
+    brightness = img_raw.mean(dim=1)  # (B, H, W)
+    return brightness > threshold  # 亮度超过阈值 → 高光
 
 
 def random_seeds(seed):
@@ -115,7 +129,6 @@ def main():
         print("load_pretrain_model")
         model.load_state_dict({k: v for k, v in torch.load(args.pretrained_from, map_location='cpu').items() if 'pretrained' in k}, strict=False)
 
-
     # for p in model.pretrained.parameters():
     #     p.requires_grad = False
     # #
@@ -143,6 +156,7 @@ def main():
     total_iters = args.epochs * len(trainloader)
 
     previous_best = {'d1': 0, 'd2': 0, 'd3': 0, 'abs_rel': 100, 'sq_rel': 100, 'rmse': 100, 'rmse_log': 100, 'log10': 100, 'silog': 100}
+    no_improve_count = 0
 
     for epoch in range(args.epochs):
         if rank == 0:
@@ -167,7 +181,8 @@ def main():
                 valid_mask = valid_mask.flip(-1)
 
             pred = model(img)
-            loss = criterion(pred, depth, (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth))
+            specular_mask = detect_specular(img)  # 高光区域检测
+            loss = criterion(pred, depth, (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth) & ~specular_mask)
             loss.backward()
             optimizer.step()
 
@@ -253,6 +268,20 @@ def main():
             current_rmse = (results['rmse'] / nsamples).item()
             if current_rmse <= previous_best['rmse']:
                 torch.save(new_state_dict, os.path.join(args.save_path, 'best_model.pth'))
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+                logger.info('Early stopping: no rmse improvement for {}/{} epochs'.format(no_improve_count, args.patience))
+
+        # 同步 no_improve_count 到所有进程
+        no_improve_tensor = torch.tensor(no_improve_count).cuda()
+        dist.broadcast(no_improve_tensor, src=0)
+        no_improve_count = int(no_improve_tensor.item())
+
+        if no_improve_count >= args.patience:
+            if rank == 0:
+                logger.info('Early stopping triggered at epoch {}'.format(epoch))
+            break
 
 if __name__ == '__main__':
     time.sleep(5)

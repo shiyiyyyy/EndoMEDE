@@ -96,6 +96,48 @@ class HWB(nn.Module):
         return out
 
 
+class ASPP(nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling
+    针对内窥镜场景使用小 dilation rate（1/2/4/8），避免大 rate 在小特征图上产生网格效应
+    """
+    def __init__(self, in_channels, out_channels, rates=[1, 2, 4, 8]):
+        super().__init__()
+        self.conv1x1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.atrous_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=r, dilation=r, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            ) for r in rates
+        ])
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.ReLU(inplace=True)
+        )
+        # 融合：1×1 + 4个空洞卷积 + global pool = 6路
+        self.project = nn.Sequential(
+            nn.Conv2d((len(rates) + 2) * out_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        size = x.shape[2:]
+        res = [self.conv1x1(x)]
+        for conv in self.atrous_convs:
+            res.append(conv(x))
+        gp = self.global_pool(x)
+        gp = F.interpolate(gp, size=size, mode='bilinear', align_corners=True)
+        res.append(gp)
+        return self.project(torch.cat(res, dim=1))
+
+
 def _make_fusion_block(features, use_bn, size=None):
     return FeatureFusionBlock(
         features,
@@ -145,7 +187,12 @@ class DPTHead(nn.Module):
                 padding=0,
             ) for out_channel in out_channels
         ])
-        self.hwlayer2 = HWB(n_feat=64, o_feat=64, kernel_size=3, reduction=8,bias=False,act=nn.GELU())
+        # ASPP：放在 refinenet 融合后，多尺度感受野覆盖内窥镜近远景深度变化
+        self.aspp = ASPP(features, features, rates=[1, 2, 4, 8])
+        # 中间阶段 HWB：作用于 path_2（特征最丰富，分辨率适中），通道数为 features
+        self.hwlayer_mid = HWB(n_feat=features, o_feat=features, kernel_size=3, reduction=8, bias=False, act=nn.GELU())
+        # 末端 HWB：作用于 output_conv1 之后（64通道），上采样前做最终细节增强
+        self.hwlayer2 = HWB(n_feat=64, o_feat=64, kernel_size=3, reduction=8, bias=False, act=nn.GELU())
         self.resize_layers = nn.ModuleList([
             nn.ConvTranspose2d(
                 in_channels=out_channels[0],
@@ -233,7 +280,9 @@ class DPTHead(nn.Module):
         path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])    #(16,128,37,37) 16,128,37,37
         path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:]) #(16,128,74,74) 16,128,37,37
         path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:]) #(16,128,148,148) 16,128,37,37
+        path_2 = self.hwlayer_mid(path_2)  # 中间 HWB：多尺度小波增强，捕获软组织纹理细节
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn) #(16,128,296,296) 16,128,74,74
+        path_1 = self.aspp(path_1)  # 多尺度感受野聚合，覆盖内窥镜近远景深度变化
 
         out = self.scratch.output_conv1(path_1) #(16,64,296,296) 16 64,74,74
         out = self.hwlayer2(out)
@@ -286,20 +335,37 @@ class DepthAnythingV2(nn.Module):
             self.pretrained.load_state_dict(pretrained_weight, strict=False)
 
 
-            # 定义LoRA配置，指定目标层为FC和QV层
-            print("load_lora")
+            # 定义DoRA配置：
+            # - 目标层：仅 attention（qkv + proj），专注几何感知
+            # - use_dora=True：幅度+方向分离更新，domain gap 大时比标准 LoRA 更稳定
+            print("load_dora")
             peft_config = LoraConfig(
                 task_type=TaskType.FEATURE_EXTRACTION,
                 inference_mode=False,
                 r=8,
-                lora_alpha=32,  # scaling=16/4=4
+                lora_alpha=32,
                 lora_dropout=0.05,
-                # 目标层：包含fc1/fc2（MLP）和q_proj/v_proj（注意力）,"attn.qkv"
-                target_modules=["mlp.fc1", "mlp.fc2","attn.qkv"],
-                use_dora=False  # 可选启用DoRA
+                target_modules=["attn.qkv", "attn.proj"],
+                use_dora=True
             )
-            # 应用PEFT到pretrained模型
+            # 应用 PEFT 到 pretrained 模型
             self.pretrained = get_peft_model(self.pretrained, peft_config)
+
+            # 手动冻结浅层（block 0-5）的 LoRA 参数，只训练深层（6-11）
+            # 浅层学的是低级特征，与自然图像差异小，无需适配
+            for name, param in self.pretrained.named_parameters():
+                if 'lora_' in name or 'lora_magnitude' in name:
+                    # 提取 block 编号
+                    parts = name.split('.')
+                    for j, part in enumerate(parts):
+                        if part == 'blocks' and j + 1 < len(parts):
+                            try:
+                                block_idx = int(parts[j + 1])
+                                if block_idx < 6:
+                                    param.requires_grad = False
+                            except ValueError:
+                                pass
+                            break
 
         self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken)
 

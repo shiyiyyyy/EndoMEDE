@@ -28,11 +28,11 @@ parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--min-depth', default=0.001, type=float)
 parser.add_argument('--max-depth', default=100, type=float)
 #parser.add_argument('--pretrained-from',default="./run/seed/lora_free_qkv_fc/40_epotwo_01/latest_model.pth",type=str)
-parser.add_argument('--checkpoint', default="results/base/40epo/latest_model.pth", type=str)
+parser.add_argument('--checkpoint', default="results/all/60epo/last_model.pth", type=str)
 #parser.add_argument('--checkpoint', default="./results/all/latest_model.pth", type=str)
 parser.add_argument('--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
-parser.add_argument("--lora_type",default="None",choices=["lora","None"],type=str,help="whether lora use for the model")
+parser.add_argument("--lora_type",default="lora",choices=["lora","None"],type=str,help="whether lora use for the model")
 
 def random_seeds(seed):
     torch.manual_seed(seed)
@@ -69,7 +69,7 @@ def main():
     elif args.dataset == 'vkitti':
         valset = KITTI('dataset/splits/kitti/val.txt', 'val', size=size)
     elif args.dataset == 'c3vd':
-        valset = C3VD('root/c3vd/val.txt', 'test', size=size)
+        valset = C3VD('root/c3vd/test.txt', 'test', size=size)
     else:
         raise NotImplementedError
 
